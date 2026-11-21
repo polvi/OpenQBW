@@ -378,6 +378,165 @@ fn run(cli: Cli) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Bytes of the header before the payload of an `I_EXTERNAL_DATA` record;
+/// the `u16` at offset 16 is the payload length.
+const EXTERNAL_HEADER: usize = 22;
+
+/// The payload of one `I_EXTERNAL_DATA` record, when its header fits it.
+fn external_payload(record: &[u8]) -> Option<&[u8]> {
+    let len = u16::from_le_bytes([*record.get(16)?, *record.get(17)?]) as usize;
+    (record.len() == EXTERNAL_HEADER + len).then(|| &record[EXTERNAL_HEADER..])
+}
+
+/// Join the records of one `I_EXTERNAL_DATA` key into its value.
+///
+/// A single record 0 is the value itself. Otherwise record 0 is a directory
+/// whose first `u32` is the total size and records 1 and up are the chunks;
+/// the value is the first `total` bytes of the joined chunks. `None` when
+/// record 0 is missing or the records do not form a value.
+fn join_external(records: &[(i64, Vec<u8>)]) -> Option<Vec<u8>> {
+    let (first, rest) = records.split_first()?;
+    if first.0 != 0 {
+        return None;
+    }
+    let head = external_payload(&first.1)?;
+    if rest.is_empty() {
+        return Some(head.to_vec());
+    }
+    if head.len() != 8 {
+        return None;
+    }
+    let total = u32::from_le_bytes([head[0], head[1], head[2], head[3]]) as usize;
+    let mut value = Vec::with_capacity(total);
+    for (i, (rec, data)) in rest.iter().enumerate() {
+        if *rec != i as i64 + 1 {
+            return None;
+        }
+        value.extend_from_slice(external_payload(data)?);
+    }
+    (value.len() >= total).then(|| {
+        value.truncate(total);
+        value
+    })
+}
+
+/// `StaticReconReports-<account id, 8 hex>-<full|sum>-<YYYYMMDD>` as
+/// `(account id, kind, date)`.
+fn recon_key(key: &str) -> Option<(i64, &'static str, String)> {
+    let mut parts = key.strip_prefix("StaticReconReports-")?.split('-');
+    let (account, kind, date) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() || account.len() != 8 || date.len() != 8 {
+        return None;
+    }
+    if !date.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let kind = match kind {
+        "full" => "detail",
+        "sum" => "summary",
+        _ => return None,
+    };
+    let date = format!("{}-{}-{}", &date[..4], &date[4..6], &date[6..]);
+    Some((i64::from_str_radix(account, 16).ok()?, kind, date))
+}
+
+/// Add `_external_values`, the values of `I_EXTERNAL_DATA` joined from
+/// their records, and the view `recon_reports`, the saved reconciliation
+/// reports among them (PDF). Returns the row counts; both are created empty
+/// when the file has no usable `I_EXTERNAL_DATA`.
+fn add_external_values(tx: &Transaction) -> Result<(u64, u64)> {
+    tx.execute_batch(
+        "CREATE TABLE _external_values (
+            key_fld TEXT PRIMARY KEY,
+            -- Records the value was joined from, the directory included.
+            records INTEGER NOT NULL,
+            size    INTEGER NOT NULL,
+            data    BLOB NOT NULL
+        );
+        -- One row per saved reconciliation report among the values.
+        CREATE TABLE _recon_report_index (
+            account_id     INTEGER NOT NULL,
+            -- The account's current name; a report may print an earlier one.
+            account_name   TEXT,
+            statement_date TEXT NOT NULL,
+            -- detail or summary.
+            kind           TEXT NOT NULL,
+            key_fld        TEXT NOT NULL REFERENCES _external_values(key_fld),
+            PRIMARY KEY (account_id, statement_date, kind)
+        );
+        -- The reports with their PDF, stored once in _external_values.
+        CREATE VIEW recon_reports AS
+            SELECT i.account_id, i.account_name, i.statement_date, i.kind,
+                   v.size, v.data AS pdf
+            FROM _recon_report_index i JOIN _external_values v USING (key_fld        );",
+    )?;
+    let has = |table: &str, columns: &[&str]| -> Result<bool> {
+        for c in columns {
+            let n: i64 = tx.query_row(
+                "SELECT count(*) FROM pragma_table_info(?) WHERE name = ?",
+                params![table, c],
+                |r| r.get(0),
+            )?;
+            if n == 0 {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    };
+    if !has("I_EXTERNAL_DATA", &["key_fld", "rec_num", "data_fld"])? {
+        return Ok((0, 0));
+    }
+    let names = has("abmc_account_user", &["account_id", "name"])?;
+    let mut by_key: BTreeMap<String, Vec<(i64, Vec<u8>)>> = BTreeMap::new();
+    {
+        let mut q = tx.prepare(
+            "SELECT key_fld, rec_num, data_fld FROM I_EXTERNAL_DATA
+             WHERE _decode_error IS NULL AND typeof(key_fld) = 'text'
+               AND typeof(rec_num) = 'integer' AND typeof(data_fld) = 'blob'
+             ORDER BY key_fld, rec_num",
+        )?;
+        let rows = q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        for row in rows {
+            let (key, rec, data): (String, i64, Vec<u8>) = row?;
+            by_key.entry(key).or_default().push((rec, data));
+        }
+    }
+    let (mut values, mut reports) = (0u64, 0u64);
+    for (key, records) in &by_key {
+        let Some(value) = join_external(records) else {
+            continue;
+        };
+        let is_pdf = value.starts_with(b"%PDF");
+        tx.execute(
+            "INSERT INTO _external_values VALUES (?,?,?,?)",
+            params![key, records.len() as i64, value.len() as i64, value],
+        )?;
+        values += 1;
+        let Some((account, kind, date)) = recon_key(key) else {
+            continue;
+        };
+        if !is_pdf {
+            continue;
+        }
+        let name: Option<String> = if names {
+            tx.query_row(
+                "SELECT name FROM abmc_account_user WHERE account_id = ?",
+                [account],
+                |r| r.get(0),
+            )
+            .ok()
+        } else {
+            None
+        };
+        tx.execute(
+            "INSERT OR IGNORE INTO _recon_report_index VALUES (?,?,?,?,?)",
+            params![account, name, date, kind, key],
+        )?;
+        reports += 1;
+    }
+    Ok((values, reports))
+}
+
 /// `name` as a quoted SQLite identifier.
 fn sql_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
@@ -417,6 +576,7 @@ fn run_tables(input: PathBuf, output: PathBuf, system: bool, lenient: bool) -> R
         CREATE TABLE _meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
     )?;
     let (mut tables, mut rows_total, mut clean_total) = (0u64, 0u64, 0u64);
+    let (external_values, recon_reports);
     {
         let tx = conn.transaction()?;
         for table in reader.tables() {
@@ -508,8 +668,11 @@ fn run_tables(input: PathBuf, output: PathBuf, system: bool, lenient: bool) -> R
             rows_total += rows.len() as u64;
             clean_total += clean;
         }
+        (external_values, recon_reports) = add_external_values(&tx)?;
         for (key, value) in [
             ("openqbw_version", env!("CARGO_PKG_VERSION").to_string()),
+            ("external_values", external_values.to_string()),
+            ("recon_reports", recon_reports.to_string()),
             ("pages", reader.page_count().to_string()),
             ("live_pages", reader.live_pages().to_string()),
             ("stale_pages", reader.stale_pages().to_string()),
@@ -524,7 +687,7 @@ fn run_tables(input: PathBuf, output: PathBuf, system: bool, lenient: bool) -> R
     staged.commit_sqlite()?;
     println!(
         "openqbw: pages={} live={} stale={} tables={tables} rows={rows_total} clean={clean_total} \
-         partial={}",
+         partial={} external_values={external_values} recon_reports={recon_reports}",
         reader.page_count(),
         reader.live_pages(),
         reader.stale_pages(),
@@ -2481,5 +2644,68 @@ mod tests {
             }
         );
         assert_eq!(c.total(), 2);
+    }
+}
+
+#[cfg(test)]
+mod external_value_tests {
+    use super::{join_external, recon_key};
+
+    /// A record: 22-byte header with the payload length at offset 16.
+    fn record(payload: &[u8]) -> Vec<u8> {
+        let mut r = vec![0u8; 22];
+        r[16..18].copy_from_slice(&(payload.len() as u16).to_le_bytes());
+        r.extend_from_slice(payload);
+        r
+    }
+
+    fn directory(total: u32) -> Vec<u8> {
+        let mut p = total.to_le_bytes().to_vec();
+        p.extend_from_slice(&[0, 1, 0, 0x60]);
+        record(&p)
+    }
+
+    #[test]
+    fn a_single_record_is_the_value() {
+        assert_eq!(join_external(&[(0, record(b"abc"))]).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn chunks_are_joined_and_cut_to_the_directory_size() {
+        let recs = [
+            (0, directory(7)),
+            (1, record(b"%PDF")),
+            (2, record(b"-1.4 stale")),
+        ];
+        assert_eq!(join_external(&recs).unwrap(), b"%PDF-1.");
+    }
+
+    #[test]
+    fn incomplete_values_are_not_joined() {
+        // No record 0: the leftover tail of a deleted value.
+        assert!(join_external(&[(2, record(b"tail"))]).is_none());
+        // A gap in the record numbers.
+        assert!(join_external(&[(0, directory(4)), (2, record(b"abcd"))]).is_none());
+        // Fewer bytes than the directory says.
+        assert!(join_external(&[(0, directory(9)), (1, record(b"abcd"))]).is_none());
+        // A header that does not fit its record.
+        assert!(join_external(&[(0, vec![0u8; 30])]).is_none());
+        assert!(join_external(&[]).is_none());
+    }
+
+    #[test]
+    fn reconciliation_report_keys() {
+        assert_eq!(
+            recon_key("StaticReconReports-0000001C-full-20240131"),
+            Some((28, "detail", "2024-01-31".to_string()))
+        );
+        assert_eq!(
+            recon_key("StaticReconReports-00000100-sum-20131203"),
+            Some((256, "summary", "2013-12-03".to_string()))
+        );
+        assert_eq!(recon_key("StaticReconReports-0000001C"), None);
+        assert_eq!(recon_key("StaticReconReports-0000001C-full-2024013x"), None);
+        assert_eq!(recon_key("StaticReconReports-1C-full-20240131"), None);
+        assert_eq!(recon_key("Other-0000001C-full-20240131"), None);
     }
 }

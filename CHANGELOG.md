@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   2024 file, where every live page verifies by its own page number and
   every row decodes to its exact length; other files are untested
   (SPECIFICATION.md section 8c).
+- `openqbw tables` also writes `_external_values`, the values of
+  `I_EXTERNAL_DATA` joined from their records, and the view
+  `recon_reports`, the saved reconciliation reports among them as PDFs
+  with account, statement date and kind.
 - `Error::KeystreamMismatch` and `ErrorKind::KeystreamMismatch` report a
   file the exact page cipher does not fit.
 

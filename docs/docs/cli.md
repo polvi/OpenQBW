@@ -108,6 +108,22 @@ name that repeats without regard to case gets a trailing underscore.
 `--system` also exports the SQL Anywhere system tables (`ISYS...`,
 `SYS...`).
 
+Two more objects are built from `I_EXTERNAL_DATA`, whose values are split
+over records (SPECIFICATION.md section 8c.7):
+
+- `_external_values(key_fld, records, size, data)`: each value joined from
+  its records. A key with no record 0 (the leftover of a deleted value) is
+  not listed.
+- `recon_reports(account_id, account_name, statement_date, kind, size,
+  pdf)`: a view of the saved reconciliation reports among them, one PDF
+  per account, statement date and kind (`detail` or `summary`).
+  `account_name` is the account's current name.
+
+```console
+$ sqlite3 tables.sqlite "SELECT writefile(statement_date || ' ' || kind || '.pdf', pdf) \
+    FROM recon_reports WHERE account_name = 'Checking'"
+```
+
 This command removes the page cipher exactly (SPECIFICATION.md section 8c)
 instead of estimating a keystream per page, so it does not use `--lenient`.
 The method was derived from one QuickBooks 2024 file. A file it does not fit
