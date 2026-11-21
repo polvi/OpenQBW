@@ -16,6 +16,7 @@
 //! the format. Their names, flags and output may change in any release.
 
 mod outfile;
+mod records;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -597,7 +598,7 @@ fn run_tables(
         CREATE TABLE _meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
     )?;
     let (mut tables, mut rows_total, mut clean_total) = (0u64, 0u64, 0u64);
-    let (external_values, recon_reports);
+    let (external_values, recon_reports, decoded_records);
     {
         let tx = conn.transaction()?;
         for table in reader.tables() {
@@ -690,10 +691,12 @@ fn run_tables(
             clean_total += clean;
         }
         (external_values, recon_reports) = add_external_values(&tx, raw_external)?;
+        decoded_records = records::add_decoded_records(&tx)?;
         for (key, value) in [
             ("openqbw_version", env!("CARGO_PKG_VERSION").to_string()),
             ("external_values", external_values.to_string()),
             ("recon_reports", recon_reports.to_string()),
+            ("decoded_records", decoded_records.to_string()),
             ("pages", reader.page_count().to_string()),
             ("live_pages", reader.live_pages().to_string()),
             ("stale_pages", reader.stale_pages().to_string()),
@@ -712,7 +715,8 @@ fn run_tables(
     staged.commit_sqlite()?;
     println!(
         "openqbw: pages={} live={} stale={} tables={tables} rows={rows_total} clean={clean_total} \
-         partial={} external_values={external_values} recon_reports={recon_reports}",
+         partial={} external_values={external_values} recon_reports={recon_reports} \
+         decoded_records={decoded_records}",
         reader.page_count(),
         reader.live_pages(),
         reader.stale_pages(),

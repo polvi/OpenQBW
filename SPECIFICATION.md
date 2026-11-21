@@ -917,6 +917,60 @@ documents holding user-interface state, SDK event lists and similar. 214
 keys have only records 2 and up, with no record 0 or 1 anywhere in the
 file; they read as leftovers of deleted values.
 
+### 8c.8 Application records
+
+`I_GENERAL`, `I_SPECIAL` and `I_RECONCILIATION_DISCREPANCY_TRACKER` have
+the same four columns as `I_EXTERNAL_DATA`, without the 22-byte header:
+`data_fld` is the record itself. In `I_GENERAL` the key is a record kind
+and `rec_num` the record's id. Two self-describing encodings cover the
+structured records; on the sample every record that starts as one of them
+parses to its last byte (84 records).
+
+**Tagged.** A list of `[tag u8][type u8][value]`. The type gives the
+size: `0x00`, `0x08`, `0x10`, `0x18` are fixed values of 1 to 4 bytes
+(`(size - 1) << 3`), `0x20` is a `u8` length and `0x28` a `u16` length
+before the value. A fixed value is a little-endian integer, or short
+text closed by a NUL (a state or country code). A length-prefixed value
+is NUL-terminated text, a nested list, or a 19-byte date and time
+(`03 00`, year `u16`, month, day, hour, minute, second, then a
+millisecond and time zone area that is `***` when unset). A record has
+four top-level fields: `0x64` id, `0x65` name, `0x66` body size, `0x67`
+body. Text values that start `AQAj777K` are base64 of encrypted fields
+and are left as they are.
+
+**Block.** A container is `05 01 0a 00 [version u16][length u16][id u16]`
+followed by its items, the length counting the 10-byte header. A field is
+`05 07 [tag u16][length u16][extra u16][value]`; a value that starts with
+a container header nests.
+
+Records with a known meaning (`I_GENERAL` key, unless noted):
+
+| Key | Encoding | Content |
+|---|---|---|
+| 14 | `ff ff` + text | Strings named by key from the discrepancy rows |
+| 22 | block | Company information: field 1002 is a fixed layout with the name at offset 4, legal name 64, address lines 124 and 166, city 208, postal code 242, country 258, industry 1570 and a creation date at 2078 |
+| 23 | block | Icon bar entries |
+| 27 | fixed | Report layouts, the name at offset 4 |
+| 31 | block | Form templates |
+| 43 | fixed, 492 bytes | An account's reconciliations: up to 120 statement dates, newest first, then at 480 the count, the account id and a Unix time (`rec_num` is the account id) |
+| 301 | tagged | Bank feed accounts (`rec_num` is the account id): nickname 101, institution 102, institution id 122 |
+| 315 | tagged | Bank feed institutions: name, address, phone, connection type and URLs under field 1 |
+| `I_SPECIAL` record 6 | text | One line per release that opened the file: version, release, date |
+
+A date in the fixed layouts is 4 bytes: day, month, year `u16`. On the
+sample every statement date of a saved reconciliation report is in the
+key 43 record of its account.
+
+A discrepancy row is one byte, then `[tag u16][value]` fields closed by
+tag `0xFFFF`. Values are 4 bytes except tag 5 (9 bytes) and tag 13 (2
+bytes): 0 a change code, 1 target id, 2 transaction id, 3 account id,
+4 statement date, 5 amount, 6 transaction date, 7 to 10 string keys
+(name, document number, memo, user), 11 a Unix time of the change, 12
+the string key of the user who made it, 13 the transaction view type.
+The amount is a zero byte, a 6-byte count of 1/100000, a byte, and a
+byte whose top bit is set on a positive amount; on the sample the five
+amounts equal `amount_amt` of the rows they name.
+
 ## 9. Change log
 
 - **2026-04-19 · C.1-C.4** - Initial specification: corpus survey,
@@ -1002,6 +1056,9 @@ file; they read as leftovers of deleted values.
   sectors. Page-walking to QB user tables is blocked on C.19.
   `fill_overlay.recover_base` also rewritten from O(256·n) to O(n)
   via a residue histogram - ~40× speed-up on full-corpus scans.
+- **2026-11-21 · 8c.8** - Application records: the tagged and block
+  encodings, company information, reconciliation dates, bank feed setup,
+  release history and the discrepancy rows.
 - **2026-11-21 · 8c** - Closed-form sector key (base, step, rotation,
   slope), rotation of each sector, layout of the last sector, the
   header/trailer exchange, the page-number check, the checkpoint log, the

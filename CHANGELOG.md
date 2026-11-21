@@ -25,6 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with account, statement date and kind. The raw `data_fld` of a joined
   value is set to NULL in `I_EXTERNAL_DATA` so it is stored once;
   `--raw-external` keeps it.
+- `openqbw tables` decodes the binary application records: the tables
+  `company_info`, `file_versions`, `recon_history`, `recon_discrepancies`,
+  `bank_feed_accounts` and `bank_feed_institutions`, and
+  `_decoded_records` with every tagged or block record as JSON
+  (SPECIFICATION.md section 8c.8).
 - `Error::KeystreamMismatch` and `ErrorKind::KeystreamMismatch` report a
   file the exact page cipher does not fit.
 

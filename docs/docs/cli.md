@@ -122,6 +122,26 @@ over records (SPECIFICATION.md section 8c.7):
   per account, statement date and kind (`detail` or `summary`).
   `account_name` is the account's current name.
 
+The binary application records of `I_GENERAL`, `I_SPECIAL` and
+`I_RECONCILIATION_DISCREPANCY_TRACKER` are decoded too (SPECIFICATION.md
+section 8c.8):
+
+- `company_info(field, value)`: company name, legal name, address,
+  industry and creation date.
+- `file_versions(seq, version, release, release_date)`: each QuickBooks
+  release that opened the file.
+- `recon_history(account_id, account_name, statement_date)`: every
+  reconciliation's statement date, up to 120 per account.
+- `recon_discrepancies`: reconciled transactions that were later changed
+  or deleted, with account, statement date, amount, memo and user.
+- `bank_feed_accounts` and `bank_feed_institutions`: the accounts set up
+  for bank feeds and their institutions.
+- `_decoded_records(source, key_fld, rec_num, format, json)`: every
+  record in the tagged or block encoding as JSON. A tagged list is
+  `[[tag, value], ...]`; a block container is `{"id", "version",
+  "items"}` and a block field `[tag, extra, value]`. Bytes with no
+  reading are `{"hex": "..."}`.
+
 ```console
 $ sqlite3 tables.sqlite "SELECT writefile(statement_date || ' ' || kind || '.pdf', pdf) \
     FROM recon_reports WHERE account_name = 'Checking'"
