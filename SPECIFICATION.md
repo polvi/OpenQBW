@@ -910,7 +910,7 @@ tail in its last chunk (19 values on the sample).
 
 On the sample 1,642 of these values are PDF documents (saved
 reconciliation reports, a detail and a summary per account and statement
-date), about 61 MiB of the table's 65 MiB, which is why those pages look
+date), about 61.5 MB of the table's 64.9 MB, which is why those pages look
 like random bytes: the PDF streams are compressed. All 1,642 pass
 `qpdf --check` once read this way. The rest are small: compound-file
 documents holding user-interface state, SDK event lists and similar. 214
