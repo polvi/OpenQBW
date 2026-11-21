@@ -14,9 +14,9 @@
 //! ```
 //!
 //! `pn` is the page number and `si` the sector index. `phase` is one bit per
-//! group of eight pages; it is not derived here, it is recovered from the page
-//! number that every page carries in its first four bytes (see
-//! [`phase_map`]).
+//! (`pn >> 9`, `q >> 9`); it only matters where `q` is odd. It is not derived
+//! here, it is recovered from the page number that every page carries in its
+//! first four bytes (see [`Phase::learn`]).
 //!
 //! The cipher walks a sector with stride `rot`. In the last sector the walk
 //! skips the 16 trailer slots, which adds `slope` to the keystream once for
@@ -30,6 +30,8 @@
 //! number check passes on every live page. A file they do not fit is
 //! reported as [`Error::KeystreamMismatch`](crate::Error::KeystreamMismatch),
 //! never decoded on a guess.
+
+use std::collections::BTreeMap;
 
 /// Bytes in a page.
 pub(crate) const PAGE: usize = 4096;
@@ -69,12 +71,98 @@ fn inverse(x: u32, bits: u32) -> u32 {
     y
 }
 
-/// The key of sector `si` of page `pn` under pairing phase `phase`.
-pub(crate) fn sector_key(pn: u64, si: usize, phase: bool) -> SectorKey {
+/// `q` of sector `si` of page `pn`; the key is a function of it and of `pn`.
+fn q_of(pn: u64, si: usize) -> i64 {
     let p = i64::try_from(pn).unwrap_or(i64::MAX);
-    let q = 103 - si as i64 - p + 2 * (p & 1) + 32 * (p >> 4);
+    103 - si as i64 - p + 2 * (p & 1) + 32 * (p >> 4)
+}
+
+/// The phase bit of the page cipher.
+///
+/// No rule for it is known. On the file it was derived from it is constant
+/// over each (`pn >> 9`, `q >> 9`): it changes at page numbers 1536, 2048,
+/// 4096 and 8192 and, inside page 1956, where `q` passes 2048.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Phase {
+    /// The same bit everywhere.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Fixed(bool),
+    /// One bit per (`pn >> 9`, `q >> 9`), as learned from a file.
+    Learned(BTreeMap<(i64, i64), bool>),
+}
+
+impl Phase {
+    /// The bit for a sector of page `pn` whose `q` is `q`.
+    ///
+    /// A pair the file gave no evidence for takes the bit of the nearest
+    /// `pn >> 9` with the same `(q >> 9) - (pn >> 9)`, then of any pair with
+    /// the same `pn >> 9`, then 0.
+    fn at(&self, pn: u64, q: i64) -> bool {
+        let map = match self {
+            Self::Fixed(bit) => return *bit,
+            Self::Learned(map) => map,
+        };
+        let n = i64::try_from(pn >> 9).unwrap_or(i64::MAX);
+        let c = q >> 9;
+        if let Some(&bit) = map.get(&(n, c)) {
+            return bit;
+        }
+        let span = map.keys().next_back().map_or(0, |k| k.0.max(n)) + 1;
+        for d in 1..=span {
+            for other in [n - d, n + d] {
+                if let Some(&bit) = map.get(&(other, other + c - n)) {
+                    return bit;
+                }
+            }
+        }
+        map.range((n, i64::MIN)..=(n, i64::MAX))
+            .next()
+            .is_some_and(|(_, &bit)| bit)
+    }
+
+    /// Learn the bit from the even pages of `pages`, the whole stored file.
+    ///
+    /// Sector 0 of an even page has odd `q`, so its key depends on the bit;
+    /// a page whose header names its own page number under exactly one
+    /// value of the bit votes for it.
+    pub(crate) fn learn(pages: &[u8]) -> Self {
+        let mut votes: BTreeMap<(i64, i64), (u32, u32)> = BTreeMap::new();
+        for pn in (2..pages.len() / PAGE).step_by(2) {
+            let raw = &pages[pn * PAGE..pn * PAGE + SECTOR];
+            if raw.iter().all(|&b| b == 0) {
+                continue;
+            }
+            let pn = pn as u64;
+            let off = names_itself(raw, pn, false);
+            let on = names_itself(raw, pn, true);
+            if off != on {
+                let v = votes
+                    .entry(((pn >> 9) as i64, q_of(pn, 0) >> 9))
+                    .or_default();
+                if on {
+                    v.1 += 1;
+                } else {
+                    v.0 += 1;
+                }
+            }
+        }
+        Self::Learned(
+            votes
+                .into_iter()
+                .filter(|&(_, (off, on))| off != on)
+                .map(|(k, (off, on))| (k, on > off))
+                .collect(),
+        )
+    }
+}
+
+/// The key of sector `si` of page `pn`.
+pub(crate) fn sector_key(pn: u64, si: usize, phase: &Phase) -> SectorKey {
+    let p = i64::try_from(pn).unwrap_or(i64::MAX);
+    let q = q_of(pn, si);
     let odd = q & 1;
-    let rot = 149 + (q - odd).rem_euclid(256) + if phase { 2 * odd } else { 0 };
+    let lift = if odd == 1 && phase.at(pn, q) { 2 } else { 0 };
+    let rot = 149 + (q - odd).rem_euclid(256) + lift;
     let slope = (5 + 2 * (q >> 9) - 4 * ((p >> 9) & !8)).rem_euclid(256) as u8;
     let step = slope.wrapping_mul(inverse(rot as u32, 8) as u8);
     let base = ((p ^ 0xF1) + si as i64 + 167).rem_euclid(256) as u8;
@@ -128,7 +216,7 @@ fn stream(key: SectorKey, i: usize) -> u8 {
 /// Restore one stored page to the SQL Anywhere page it holds.
 ///
 /// A page of zeros was never written and is returned as it is.
-pub(crate) fn decode_page(raw: &[u8], pn: u64, phase: bool) -> Vec<u8> {
+pub(crate) fn decode_page(raw: &[u8], pn: u64, phase: &Phase) -> Vec<u8> {
     let mut out = vec![0u8; PAGE];
     if raw.len() != PAGE || raw.iter().all(|&b| b == 0) {
         out[..raw.len().min(PAGE)].copy_from_slice(&raw[..raw.len().min(PAGE)]);
@@ -162,63 +250,16 @@ pub(crate) fn decode_page(raw: &[u8], pn: u64, phase: bool) -> Vec<u8> {
     out
 }
 
-/// `true` when the first four plaintext bytes of the page, read with
-/// `phase`, are its own page number.
-fn names_itself(raw: &[u8], pn: u64, phase: bool) -> bool {
-    let key = sector_key(pn, 0, phase);
+/// `true` when the first four plaintext bytes of the page, read with the
+/// phase bit `bit`, are its own page number.
+fn names_itself(raw: &[u8], pn: u64, bit: bool) -> bool {
+    let key = sector_key(pn, 0, &Phase::Fixed(bit));
     let mut head = [0u8; 4];
     for (t, h) in head.iter_mut().enumerate() {
         let i = (t + key.rot) % SECTOR;
         *h = raw[i].wrapping_sub(stream(key, i));
     }
     u64::from(u32::from_le_bytes(head)) == pn
-}
-
-/// Pairing phase of each group of eight pages.
-///
-/// The phase changes the first sector of an even page, so an even page whose
-/// header names its own page number under exactly one phase decides its
-/// group. A group with no such page takes the phase of the nearest decided
-/// group before it, or after it when there is none before.
-pub(crate) fn phase_map(pages: &[u8]) -> Vec<bool> {
-    let count = pages.len() / PAGE;
-    let groups = count.div_ceil(8);
-    let mut votes = vec![(0u32, 0u32); groups];
-    for pn in (2..count).step_by(2) {
-        let raw = &pages[pn * PAGE..pn * PAGE + SECTOR];
-        if raw.iter().all(|&b| b == 0) {
-            continue;
-        }
-        let off = names_itself(raw, pn as u64, false);
-        let on = names_itself(raw, pn as u64, true);
-        if off != on {
-            let v = &mut votes[pn >> 3];
-            if on {
-                v.1 += 1;
-            } else {
-                v.0 += 1;
-            }
-        }
-    }
-    let mut phase: Vec<Option<bool>> = votes
-        .iter()
-        .map(|&(off, on)| (off != on).then_some(on > off))
-        .collect();
-    let mut seen = None;
-    for p in &mut phase {
-        match *p {
-            Some(v) => seen = Some(v),
-            None => *p = seen,
-        }
-    }
-    let mut seen = None;
-    for p in phase.iter_mut().rev() {
-        match *p {
-            Some(v) => seen = Some(v),
-            None => *p = seen,
-        }
-    }
-    phase.into_iter().map(|p| p.unwrap_or(false)).collect()
 }
 
 /// A company file with the page cipher removed.
@@ -232,14 +273,14 @@ impl PlainImage {
     /// Decode every page of `stored`, the whole file.
     pub(crate) fn decode(stored: &[u8]) -> Self {
         let count = stored.len() / PAGE;
-        let phase = phase_map(stored);
+        let phase = Phase::learn(stored);
         let mut bytes = Vec::with_capacity(count * PAGE);
         let mut live = vec![false; count];
         let mut written = 0;
         bytes.extend_from_slice(&stored[..PAGE.min(stored.len())]);
         for pn in 1..count {
             let raw = &stored[pn * PAGE..(pn + 1) * PAGE];
-            let page = decode_page(raw, pn as u64, phase[pn >> 3]);
+            let page = decode_page(raw, pn as u64, &phase);
             if raw.iter().any(|&b| b != 0) {
                 written += 1;
                 live[pn] = u32::from_le_bytes([page[0], page[1], page[2], page[3]]) as usize == pn;
@@ -285,8 +326,11 @@ impl PlainImage {
 pub(crate) mod tests {
     use super::*;
 
+    const ON: Phase = Phase::Fixed(true);
+    const OFF: Phase = Phase::Fixed(false);
+
     /// Inverse of [`decode_page`], for building test files.
-    pub(crate) fn encode_page(plain: &[u8], pn: u64, phase: bool) -> Vec<u8> {
+    pub(crate) fn encode_page(plain: &[u8], pn: u64, phase: &Phase) -> Vec<u8> {
         let mut work = plain.to_vec();
         let mut raw = vec![0u8; PAGE];
         raw[TRAILER..TRAILER + 2].copy_from_slice(&plain[18..20]);
@@ -341,7 +385,7 @@ pub(crate) mod tests {
         ] {
             for si in 0..SECTORS {
                 for phase in [false, true] {
-                    let k = sector_key(pn, si, phase);
+                    let k = sector_key(pn, si, &Phase::Fixed(phase));
                     assert_eq!(k.rot % 2, 1);
                     assert!((149..=405).contains(&k.rot));
                     assert_eq!(k.step.wrapping_mul(k.rot as u8), k.slope);
@@ -354,7 +398,7 @@ pub(crate) mod tests {
     fn known_sector_keys() {
         // Page 1, sector 0, phase on: q = 103 - 1 + 2 = 104.
         assert_eq!(
-            sector_key(1, 0, true),
+            sector_key(1, 0, &ON),
             SectorKey {
                 base: 0xF0u8.wrapping_add(167),
                 step: 5u8.wrapping_mul(inverse(253, 8) as u8),
@@ -363,8 +407,8 @@ pub(crate) mod tests {
             }
         );
         // The phase moves only sectors whose q is odd.
-        assert_eq!(sector_key(1, 0, false), sector_key(1, 0, true));
-        assert_eq!(sector_key(2, 0, false).rot + 2, sector_key(2, 0, true).rot);
+        assert_eq!(sector_key(1, 0, &OFF), sector_key(1, 0, &ON));
+        assert_eq!(sector_key(2, 0, &OFF).rot + 2, sector_key(2, 0, &ON).rot);
     }
 
     #[test]
@@ -387,42 +431,83 @@ pub(crate) mod tests {
             1u64, 2, 3, 168, 169, 425, 680, 1536, 1957, 4097, 20_304, 31_348,
         ] {
             for phase in [false, true] {
+                let phase = Phase::Fixed(phase);
                 let plain = noise_page(pn);
-                let raw = encode_page(&plain, pn, phase);
-                assert_eq!(
-                    decode_page(&raw, pn, phase),
-                    plain,
-                    "page {pn}, phase {phase}"
-                );
+                let raw = encode_page(&plain, pn, &phase);
+                assert_eq!(decode_page(&raw, pn, &phase), plain, "page {pn}, {phase:?}");
             }
         }
     }
 
     #[test]
     fn unwritten_page_stays_zero() {
-        assert!(decode_page(&[0u8; PAGE], 7, false).iter().all(|&b| b == 0));
+        assert!(decode_page(&[0u8; PAGE], 7, &OFF).iter().all(|&b| b == 0));
+    }
+
+    /// The bit as it lies on the file the cipher was derived from, for the
+    /// pairs the tests touch.
+    fn sample_phase() -> Phase {
+        Phase::Learned(BTreeMap::from([
+            ((0, 0), true),
+            ((1, 1), true),
+            ((3, 3), false),
+            ((3, 4), true),
+            ((4, 4), false),
+        ]))
     }
 
     #[test]
-    fn phase_is_recovered_per_group_and_fills_gaps() {
-        // Groups 0 and 1 phase on, group 2 unwritten, group 3 phase off.
-        let mut file = vec![0u8; PAGE * 32];
-        for pn in 1u64..32 {
-            let phase = match pn >> 3 {
-                0 | 1 => true,
-                2 => continue,
-                _ => false,
-            };
-            let raw = encode_page(&noise_page(pn), pn, phase);
+    fn phase_can_change_inside_a_page() {
+        // Page 1956: q runs 2051 down to 2044, so sectors 0 and 2 (q 2051,
+        // 2049) lie in pair (3, 4) and sectors 4 and 6 (q 2047, 2045) in
+        // pair (3, 3).
+        let phase = sample_phase();
+        let rot = |si, p: &Phase| sector_key(1956, si, p).rot;
+        assert_eq!(rot(0, &phase), rot(0, &ON));
+        assert_eq!(rot(2, &phase), rot(2, &ON));
+        assert_eq!(rot(4, &phase), rot(4, &OFF));
+        assert_eq!(rot(6, &phase), rot(6, &OFF));
+        assert_ne!(rot(4, &ON), rot(4, &OFF));
+        let plain = noise_page(1956);
+        let raw = encode_page(&plain, 1956, &phase);
+        assert_eq!(decode_page(&raw, 1956, &phase), plain);
+        assert_ne!(decode_page(&raw, 1956, &ON), plain);
+        assert_ne!(decode_page(&raw, 1956, &OFF), plain);
+    }
+
+    #[test]
+    fn phase_is_learned_from_even_pages() {
+        let truth = sample_phase();
+        let mut file = vec![0u8; PAGE * 2060];
+        // One even page in each pair, and page 1957 to decode afterwards.
+        for pn in [2u64, 600, 1540, 1956, 1957, 1962, 2050] {
+            let raw = encode_page(&noise_page(pn), pn, &truth);
             file[pn as usize * PAGE..(pn as usize + 1) * PAGE].copy_from_slice(&raw);
         }
-        assert_eq!(phase_map(&file), [true, true, true, false]);
+        assert_eq!(Phase::learn(&file), truth);
         let image = PlainImage::decode(&file);
-        assert_eq!(image.page_count(), 32);
-        assert_eq!(image.written_pages(), 23);
-        assert_eq!(image.live_pages(), 23);
-        assert_eq!(image.page(9).unwrap(), &noise_page(9)[..]);
+        assert_eq!(image.page_count(), 2060);
+        assert_eq!(image.written_pages(), 7);
+        assert_eq!(image.live_pages(), 7);
+        assert_eq!(image.page(1956).unwrap(), &noise_page(1956)[..]);
+        assert_eq!(image.page(1957).unwrap(), &noise_page(1957)[..]);
         assert!(image.page(16).is_none(), "unwritten page");
+    }
+
+    #[test]
+    fn unseen_pairs_take_the_nearest_evidence() {
+        let phase = sample_phase();
+        // Seen.
+        assert!(phase.at(1956, 2051));
+        assert!(!phase.at(1956, 2047));
+        // (2, 2) is unseen: nearest page superblock with q in the same one.
+        assert!(phase.at(1100, 1100));
+        // (5, 5): nearest is (4, 4).
+        assert!(!phase.at(2600, 2600));
+        // (4, 5): the nearest with q one superblock ahead is (3, 4).
+        assert!(phase.at(2500, 2600));
+        // Nothing learned at all.
+        assert!(!Phase::Learned(BTreeMap::new()).at(10, 100));
     }
 
     #[test]
@@ -435,7 +520,7 @@ pub(crate) mod tests {
             } else {
                 noise_page(pn)
             };
-            let raw = encode_page(&plain, pn, false);
+            let raw = encode_page(&plain, pn, &OFF);
             file[pn as usize * PAGE..(pn as usize + 1) * PAGE].copy_from_slice(&raw);
         }
         let image = PlainImage::decode(&file);

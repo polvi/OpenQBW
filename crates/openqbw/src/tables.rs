@@ -686,7 +686,11 @@ mod tests {
     fn stored(pages: &[Vec<u8>]) -> Vec<u8> {
         let mut file = vec![0u8; PAGE];
         for (i, pg) in pages.iter().enumerate() {
-            file.extend(encode_page(pg, i as u64 + 1, false));
+            file.extend(encode_page(
+                pg,
+                i as u64 + 1,
+                &crate::cipher::Phase::Fixed(false),
+            ));
         }
         file
     }

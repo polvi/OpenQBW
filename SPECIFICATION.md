@@ -766,11 +766,15 @@ relation `step * rot = slope (mod 256)` is why `step` looks irregular: it
 is the modular inverse of a value that changes by 2 from one sector pair to
 the next, scaled by a slowly changing `slope`.
 
-`phase` is one bit. On the sample it is 1 for pages 0..1535, 1952..1959,
-1968..2047 and 4096..8191, and 0 elsewhere; no rule for it was found. It
-only matters where `q` is odd, where it moves `rot` by 2. It is recovered
-per group of eight pages from the page-number check (8c.4) on even pages,
-whose first sector has odd `q`.
+`phase` is one bit that only matters where `q` is odd, where it moves
+`rot` by 2. No rule for it was found. On the sample it is constant over
+each pair (`pn >> 9`, `q >> 9`): it is 1 for `pn >> 9` in 0..2 and 8..15,
+0 for 4..7 and for 16 and up, and for `pn >> 9 = 3` it is 0 where
+`q < 2048` and 1 where `q >= 2048`. So it changes at page numbers 1536,
+2048, 4096 and 8192 and once inside a page, between sectors 3 and 4 of
+page 1956. It is recovered per pair from the page-number check (8c.4) on
+even pages, whose first sector has odd `q`; a pair with no such page takes
+the bit of the nearest `pn >> 9` with the same `(q >> 9) - (pn >> 9)`.
 
 ### 8c.2 Rotation
 
@@ -888,12 +892,30 @@ described in section 8b is a checkpoint-log image was not examined.
 
 ### 8c.6 Open
 
-- A rule for `phase`.
+- A rule for `phase`, and whether its dependence on both `pn >> 9` and
+  `q >> 9` is the whole story.
 - Whether the constants hold on other files and QuickBooks versions.
-- More than half of the sample's pages belong to one table of binary
-  values (`I_EXTERNAL_DATA`) whose content is high-entropy after decoding;
-  the values resolve to their declared sizes, and what they hold was not
-  examined.
+
+### 8c.7 `I_EXTERNAL_DATA`
+
+More than half of the sample's pages belong to one table,
+`I_EXTERNAL_DATA(key_fld, rec_num, data_size, data_fld)`, which holds
+named application values. Each `data_fld` starts with a 22-byte header
+whose `u16` at offset 16 is the length of the payload after it. A value
+larger than one record is split: record 0 has an 8-byte payload (total
+size `u32`, a `u16`, chunk size `u16`, 24576 on the sample) and records
+1 and up carry the chunks. The value is the first `total size` bytes of
+the joined chunks; a value saved again at a smaller size leaves a stale
+tail in its last chunk (19 values on the sample).
+
+On the sample 1,642 of these values are PDF documents (saved
+reconciliation reports, a detail and a summary per account and statement
+date), about 61 MiB of the table's 65 MiB, which is why those pages look
+like random bytes: the PDF streams are compressed. All 1,642 pass
+`qpdf --check` once read this way. The rest are small: compound-file
+documents holding user-interface state, SDK event lists and similar. 214
+keys have only records 2 and up, with no record 0 or 1 anywhere in the
+file; they read as leftovers of deleted values.
 
 ## 9. Change log
 
