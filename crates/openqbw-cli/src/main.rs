@@ -83,6 +83,11 @@ enum Cmd {
         /// `ISYS` or `SYS`).
         #[arg(long)]
         system: bool,
+        /// Keep the raw `data_fld` records of `I_EXTERNAL_DATA` for values
+        /// that were joined into `_external_values`. By default they are
+        /// set to NULL, so each value is stored once.
+        #[arg(long)]
+        raw_external: bool,
     },
     /// Export transactions and line items to SQLite, attributing each
     /// line item to its source table via SYSTABLE. The attribution is by
@@ -349,7 +354,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
             input,
             output,
             system,
-        } => run_tables(input, output, system, lenient),
+            raw_external,
+        } => run_tables(input, output, system, raw_external, lenient),
         Cmd::Export { input, output } => run_export(input, output, lenient).map(|_| ()),
         Cmd::Catalog { input, user_only } => run_catalog(input, user_only, lenient),
         Cmd::Verify { .. } => unreachable!("handled above"),
@@ -443,8 +449,10 @@ fn recon_key(key: &str) -> Option<(i64, &'static str, String)> {
 /// Add `_external_values`, the values of `I_EXTERNAL_DATA` joined from
 /// their records, and the view `recon_reports`, the saved reconciliation
 /// reports among them (PDF). Returns the row counts; both are created empty
-/// when the file has no usable `I_EXTERNAL_DATA`.
-fn add_external_values(tx: &Transaction) -> Result<(u64, u64)> {
+/// when the file has no usable `I_EXTERNAL_DATA`. Unless `keep_raw`, the
+/// `data_fld` of every record that went into a joined value is set to NULL,
+/// so the value is stored once; records that could not be joined keep theirs.
+fn add_external_values(tx: &Transaction, keep_raw: bool) -> Result<(u64, u64)> {
     tx.execute_batch(
         "CREATE TABLE _external_values (
             key_fld TEXT PRIMARY KEY,
@@ -534,6 +542,13 @@ fn add_external_values(tx: &Transaction) -> Result<(u64, u64)> {
         )?;
         reports += 1;
     }
+    if !keep_raw {
+        tx.execute(
+            "UPDATE I_EXTERNAL_DATA SET data_fld = NULL
+             WHERE key_fld IN (SELECT key_fld FROM _external_values)",
+            [],
+        )?;
+    }
     Ok((values, reports))
 }
 
@@ -544,7 +559,13 @@ fn sql_ident(name: &str) -> String {
 
 /// Export every table to SQLite. As with `export`, nothing at `output` is
 /// touched until the new database is complete.
-fn run_tables(input: PathBuf, output: PathBuf, system: bool, lenient: bool) -> Result<()> {
+fn run_tables(
+    input: PathBuf,
+    output: PathBuf,
+    system: bool,
+    raw_external: bool,
+    lenient: bool,
+) -> Result<()> {
     outfile::check_output(&input, &output)?;
     let options = if lenient {
         ReadOptions::lenient()
@@ -668,7 +689,7 @@ fn run_tables(input: PathBuf, output: PathBuf, system: bool, lenient: bool) -> R
             rows_total += rows.len() as u64;
             clean_total += clean;
         }
-        (external_values, recon_reports) = add_external_values(&tx)?;
+        (external_values, recon_reports) = add_external_values(&tx, raw_external)?;
         for (key, value) in [
             ("openqbw_version", env!("CARGO_PKG_VERSION").to_string()),
             ("external_values", external_values.to_string()),
@@ -680,6 +701,10 @@ fn run_tables(input: PathBuf, output: PathBuf, system: bool, lenient: bool) -> R
             tx.execute("INSERT INTO _meta VALUES (?,?)", params![key, value])?;
         }
         tx.commit()?;
+    }
+    if !raw_external {
+        // Give back the pages the raw records occupied.
+        conn.execute_batch("VACUUM")?;
     }
     conn.close()
         .map_err(|(_, e)| e)

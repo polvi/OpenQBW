@@ -114,6 +114,9 @@ over records (SPECIFICATION.md section 8c.7):
 - `_external_values(key_fld, records, size, data)`: each value joined from
   its records. A key with no record 0 (the leftover of a deleted value) is
   not listed.
+  The `data_fld` of the records it was joined from is set to NULL in
+  `I_EXTERNAL_DATA`, so each value is stored once; `--raw-external` keeps
+  the raw records too.
 - `recon_reports(account_id, account_name, statement_date, kind, size,
   pdf)`: a view of the saved reconciliation reports among them, one PDF
   per account, statement date and kind (`detail` or `summary`).

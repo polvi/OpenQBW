@@ -22,7 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `openqbw tables` also writes `_external_values`, the values of
   `I_EXTERNAL_DATA` joined from their records, and the view
   `recon_reports`, the saved reconciliation reports among them as PDFs
-  with account, statement date and kind.
+  with account, statement date and kind. The raw `data_fld` of a joined
+  value is set to NULL in `I_EXTERNAL_DATA` so it is stored once;
+  `--raw-external` keeps it.
 - `Error::KeystreamMismatch` and `ErrorKind::KeystreamMismatch` report a
   file the exact page cipher does not fit.
 
