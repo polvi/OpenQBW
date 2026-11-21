@@ -33,6 +33,11 @@ OpenQBW is in active development. The current code can:
   invoices.
 - Attribute pages to tables by position. The attribution is unverified; see
   below.
+- Export **every table** to SQLite with real column names and types
+  (`openqbw tables`), by removing the page cipher exactly. This path was
+  derived from one QuickBooks 2024 file and is untested on others; a file
+  it does not fit is refused, not guessed at. See SPECIFICATION.md
+  section 8c.
 - Export transactions and line items to SQLite, CSV or IIF. The catalog is
   exported in CSV only (`catalog.csv`); SQLite does not carry it.
 
@@ -148,6 +153,10 @@ $ openqbw --lenient catalog mybooks.qbw
 
 # Columns recovered for one table
 $ openqbw --lenient schema mybooks.qbw abmc_invoice_header
+
+# Every table, with the catalog's column names, to SQLite. Each row carries
+# _page, _slot, _decode_error and _raw_tail; _decode_stats summarises tables.
+$ openqbw tables mybooks.qbw tables.sqlite
 
 # Export transactions and line items to SQLite for inspection in any
 # SQL tool (DB Browser, Datasette, pandas, ...). The output is built in a

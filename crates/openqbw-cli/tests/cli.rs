@@ -795,3 +795,29 @@ fn damaged_qbb_backup_fails_with_a_backup_error() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("cannot read QBB backup"), "{err}");
 }
+
+#[test]
+fn tables_refuses_a_file_the_exact_cipher_does_not_fit() {
+    // The synthetic fixtures are written with the estimated keystream, not
+    // the closed-form one, so no page names its own page number.
+    let dir = tmp("tables-mismatch");
+    let db = dir.join("out.sqlite");
+    std::fs::write(&db, b"earlier export").unwrap();
+    let out = openqbw(&["tables".as_ref(), os(&fixture("synthetic.qbw")), os(&db)]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let err = stderr(&out);
+    assert!(err.contains("name their own page number"), "{err}");
+    assert!(!err.contains("--lenient"), "lenient cannot help: {err}");
+    assert_eq!(std::fs::read(&db).unwrap(), b"earlier export");
+}
+
+#[test]
+fn tables_refuses_to_write_over_its_input() {
+    let dir = tmp("tables-input");
+    let qbw = dir.join("books.qbw");
+    std::fs::copy(fixture("synthetic.qbw"), &qbw).unwrap();
+    let before = std::fs::read(&qbw).unwrap();
+    let out = openqbw(&["tables".as_ref(), os(&qbw), os(&qbw)]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert_eq!(std::fs::read(&qbw).unwrap(), before);
+}

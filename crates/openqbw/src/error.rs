@@ -123,6 +123,19 @@ pub enum Error {
         /// All `E` pages.
         extent: u64,
     },
+    /// The page cipher constants do not fit this file: after decoding, too
+    /// few pages carry their own page number. No table was read.
+    #[error(
+        "{validated} of {pages} written pages name their own page number after decoding; \
+         the page cipher of this file is not the one this reader knows"
+    )]
+    #[non_exhaustive]
+    KeystreamMismatch {
+        /// Pages whose header names their own page number.
+        validated: u64,
+        /// Pages that are not all zeros.
+        pages: u64,
+    },
 }
 
 /// Why a QBB backup could not be unpacked. Carried by [`Error::Backup`].
@@ -205,6 +218,8 @@ pub enum ErrorKind {
     TruncatedValue,
     /// [`Error::ContentOpaque`]
     ContentOpaque,
+    /// [`Error::KeystreamMismatch`]
+    KeystreamMismatch,
 }
 
 impl ErrorKind {
@@ -222,6 +237,7 @@ impl ErrorKind {
             Self::InvalidValueLength => "invalid_value_length",
             Self::TruncatedValue => "truncated_value",
             Self::ContentOpaque => "content_opaque",
+            Self::KeystreamMismatch => "keystream_mismatch",
         }
     }
 }
@@ -241,6 +257,7 @@ impl Error {
             Self::InvalidValueLength { .. } => ErrorKind::InvalidValueLength,
             Self::TruncatedValue { .. } => ErrorKind::TruncatedValue,
             Self::ContentOpaque { .. } => ErrorKind::ContentOpaque,
+            Self::KeystreamMismatch { .. } => ErrorKind::KeystreamMismatch,
         }
     }
 

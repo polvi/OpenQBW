@@ -3,6 +3,7 @@
 //! Subcommands:
 //!
 //! ```text
+//! openqbw tables    <input.qbw> <output.db>   # every table, with column names, to SQLite
 //! openqbw export    <input.qbw> <output.db>   # multi-transaction SQLite export
 //! openqbw catalog   <input.qbw>               # SYSTABLE listing
 //! openqbw schema    <input.qbw> <table>       # recovered columns of a table
@@ -25,7 +26,7 @@ use clap::{Parser, Subcommand};
 use openqbw::diagnostics::{self, CrossValidation};
 use openqbw::{
     Decimal, Error as QbwError, ErrorKind, LineItem, ReadOptions, Reader, SysTableEntry,
-    TransactionHeader, Warning, WarningKind,
+    TableReader, TransactionHeader, Value, Warning, WarningKind,
 };
 use outfile::{Staged, StagedSet};
 use rusqlite::{Connection, Transaction, params};
@@ -67,6 +68,22 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
+    /// Export every table of the company file to SQLite, one SQLite table
+    /// per source table, with the catalog's column names. Rows are decoded
+    /// by column type after the page cipher is removed exactly. Each row
+    /// carries `_page`, `_slot`, `_decode_error` and `_raw_tail`; the last
+    /// two are NULL for a row that decoded completely. `_decode_stats` has
+    /// one row per exported table.
+    Tables {
+        /// Input QBW file or QBB backup.
+        input: PathBuf,
+        /// Output SQLite database (will be overwritten).
+        output: PathBuf,
+        /// Also export the SQL Anywhere system tables (names starting
+        /// `ISYS` or `SYS`).
+        #[arg(long)]
+        system: bool,
+    },
     /// Export transactions and line items to SQLite, attributing each
     /// line item to its source table via SYSTABLE. The attribution is by
     /// page position only and is unverified (`meta.source_table_attribution`).
@@ -328,6 +345,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
         });
     }
     match cli.cmd {
+        Cmd::Tables {
+            input,
+            output,
+            system,
+        } => run_tables(input, output, system, lenient),
         Cmd::Export { input, output } => run_export(input, output, lenient).map(|_| ()),
         Cmd::Catalog { input, user_only } => run_catalog(input, user_only, lenient),
         Cmd::Verify { .. } => unreachable!("handled above"),
@@ -354,6 +376,168 @@ fn run(cli: Cli) -> Result<ExitCode> {
         },
     }?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// `name` as a quoted SQLite identifier.
+fn sql_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Export every table to SQLite. As with `export`, nothing at `output` is
+/// touched until the new database is complete.
+fn run_tables(input: PathBuf, output: PathBuf, system: bool, lenient: bool) -> Result<()> {
+    outfile::check_output(&input, &output)?;
+    let options = if lenient {
+        ReadOptions::lenient()
+    } else {
+        ReadOptions::strict()
+    };
+    let reader = TableReader::open(&input, &options)
+        .map_err(|e| anyhow::Error::new(e).context(format!("opening {input:?}")))?;
+
+    let staged = Staged::new(&output);
+    // A leftover from a crashed run with the same process id.
+    let _ = std::fs::remove_file(staged.path());
+    let mut conn =
+        Connection::open(staged.path()).with_context(|| format!("creating {:?}", output))?;
+    conn.execute_batch(
+        "CREATE TABLE _decode_stats (
+            table_name TEXT PRIMARY KEY,
+            table_id   INTEGER NOT NULL,
+            pages      INTEGER NOT NULL,
+            rows       INTEGER NOT NULL,
+            -- Rows that decoded completely.
+            clean      INTEGER NOT NULL,
+            -- Rows with a _decode_error.
+            partial    INTEGER NOT NULL,
+            columns    INTEGER NOT NULL,
+            -- Column ids the catalog does not list, comma-separated.
+            missing_columns TEXT NOT NULL
+        );
+        CREATE TABLE _meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+    )?;
+    let (mut tables, mut rows_total, mut clean_total) = (0u64, 0u64, 0u64);
+    {
+        let tx = conn.transaction()?;
+        for table in reader.tables() {
+            let is_system = table.name.starts_with("ISYS") || table.name.starts_with("SYS");
+            if (is_system && !system) || table.name.starts_with('_') {
+                continue;
+            }
+            let rows = reader.rows(table);
+            if rows.is_empty() {
+                continue;
+            }
+            // SQLite column names are case-insensitive; a repeat gets a
+            // trailing underscore, as does one that collides with a
+            // bookkeeping column.
+            let mut seen: Vec<String> = ["_page", "_slot", "_decode_error", "_raw_tail"]
+                .map(String::from)
+                .to_vec();
+            let mut names = Vec::with_capacity(table.columns.len());
+            for col in &table.columns {
+                let mut name = col.name.clone();
+                while seen.contains(&name.to_ascii_lowercase()) {
+                    name.push('_');
+                }
+                seen.push(name.to_ascii_lowercase());
+                names.push(sql_ident(&name));
+            }
+            let ident = sql_ident(&table.name);
+            tx.execute(
+                &format!(
+                    "CREATE TABLE {ident} (_page INTEGER, _slot INTEGER, _decode_error TEXT, \
+                     _raw_tail BLOB, {})",
+                    names.join(", ")
+                ),
+                [],
+            )?;
+            let marks = vec!["?"; names.len() + 4].join(",");
+            let mut insert = tx.prepare(&format!("INSERT INTO {ident} VALUES ({marks})"))?;
+            let mut clean = 0u64;
+            for row in &rows {
+                use rusqlite::types::Value as Sql;
+                let mut bound: Vec<Sql> = Vec::with_capacity(names.len() + 4);
+                bound.push(Sql::Integer(row.page as i64));
+                bound.push(Sql::Integer(row.slot.into()));
+                match &row.error {
+                    Some(e) => {
+                        bound.push(Sql::Text(e.clone()));
+                        bound.push(Sql::Blob(row.raw_tail.clone()));
+                    }
+                    None => {
+                        clean += 1;
+                        bound.push(Sql::Null);
+                        bound.push(Sql::Null);
+                    }
+                }
+                for v in &row.values {
+                    bound.push(match v {
+                        Value::Int(i) => Sql::Integer(*i),
+                        // SQLite integers are signed; a larger value is
+                        // kept exactly as text.
+                        Value::UInt(u) => i64::try_from(*u)
+                            .map_or_else(|_| Sql::Text(u.to_string()), Sql::Integer),
+                        Value::Float(f) => Sql::Real(*f),
+                        Value::Text(s)
+                        | Value::Decimal(s)
+                        | Value::Date(s)
+                        | Value::Timestamp(s) => Sql::Text(s.clone()),
+                        Value::Bytes(b) => Sql::Blob(b.clone()),
+                        _ => Sql::Null,
+                    });
+                }
+                insert.execute(rusqlite::params_from_iter(bound))?;
+            }
+            drop(insert);
+            let missing: Vec<String> = table.missing_columns.iter().map(u32::to_string).collect();
+            tx.execute(
+                "INSERT INTO _decode_stats VALUES (?,?,?,?,?,?,?,?)",
+                params![
+                    table.name,
+                    table.id,
+                    table.page_count as i64,
+                    rows.len() as i64,
+                    clean as i64,
+                    (rows.len() as u64 - clean) as i64,
+                    table.columns.len() as i64,
+                    missing.join(","),
+                ],
+            )?;
+            tables += 1;
+            rows_total += rows.len() as u64;
+            clean_total += clean;
+        }
+        for (key, value) in [
+            ("openqbw_version", env!("CARGO_PKG_VERSION").to_string()),
+            ("pages", reader.page_count().to_string()),
+            ("live_pages", reader.live_pages().to_string()),
+            ("stale_pages", reader.stale_pages().to_string()),
+        ] {
+            tx.execute("INSERT INTO _meta VALUES (?,?)", params![key, value])?;
+        }
+        tx.commit()?;
+    }
+    conn.close()
+        .map_err(|(_, e)| e)
+        .with_context(|| format!("closing {:?}", output))?;
+    staged.commit_sqlite()?;
+    println!(
+        "openqbw: pages={} live={} stale={} tables={tables} rows={rows_total} clean={clean_total} \
+         partial={}",
+        reader.page_count(),
+        reader.live_pages(),
+        reader.stale_pages(),
+        rows_total - clean_total
+    );
+    if reader.stale_pages() > 0 {
+        eprintln!(
+            "warning: tables: {} pages hold earlier images of other pages (the checkpoint log) \
+             and were not read",
+            reader.stale_pages()
+        );
+    }
+    Ok(())
 }
 
 /// Export to SQLite. Nothing at `output` is touched until the input has

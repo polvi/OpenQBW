@@ -28,6 +28,22 @@
 //! [`Warning`]s. [`Error`], [`WarningKind`], [`RecordFlag`] and the result
 //! types are `#[non_exhaustive]`.
 //!
+//! # Whole tables
+//!
+//! [`TableReader`] reads the catalog and every row of any table, with column
+//! names and types, by removing the page cipher exactly instead of
+//! estimating it page by page:
+//!
+//! ```no_run
+//! use openqbw::{ReadOptions, TableReader};
+//!
+//! let reader = TableReader::open("mybooks.qbw", &ReadOptions::default())?;
+//! for table in reader.tables() {
+//!     println!("{}: {} rows", table.name, reader.rows(table).len());
+//! }
+//! # Ok::<(), openqbw::Error>(())
+//! ```
+//!
 //! [`diagnostics`] holds reverse-engineering cross-checks and is outside
 //! semantic versioning.
 //!
@@ -40,6 +56,7 @@
 mod attribution_content;
 mod attribution_schema;
 mod bv_recovery;
+mod cipher;
 mod date;
 mod decimal;
 mod decode;
@@ -59,6 +76,7 @@ mod syscolumn;
 mod sysindex;
 mod sysobject;
 mod systable;
+mod tables;
 mod transaction_header;
 
 #[cfg(test)]
@@ -75,4 +93,5 @@ pub use scan::{Leniency, ReadOptions, RecordFlag, Scan, Warning, WarningKind};
 pub use syscolumn::{SchemaRecovery, SysColumn, SyscolumnStats};
 pub use sysindex::SysIndexEntry;
 pub use systable::SysTableEntry;
+pub use tables::{Column, Row, Table, TableReader, Value};
 pub use transaction_header::TransactionHeader;

@@ -730,6 +730,171 @@ at the cost of large values being silently absent from its output.
   constant-value coincidences. Require ≥ 3 *distinct* observed values
   before trusting a fixed-offset anchor for a money field.
 
+## 8c. Exact page cipher and row store (one QuickBooks 2024 file)
+
+Everything in this section was derived from a single lawfully owned
+QuickBooks 2024 company file (31,478 pages) by analysis of its bytes alone,
+and is implemented in `crates/openqbw/src/cipher.rs` and `tables.rs`
+(`openqbw tables`, `TableReader`). It has not been checked against the
+112-file corpus or the Rock Castle sample. Section 2.2c says the keystream
+does not depend on file identity, which suggests the constants carry over,
+but that is not shown here. A file they do not fit fails the page-number
+check below and is reported as an error, not decoded.
+
+On that file the check passes on all 31,349 live pages, every row of every
+exported table decodes to its exact length (195,724 rows in 91 tables), and
+4,713 of 4,738 ledger legs (99.5%) of a QuickBooks report export covering
+nine months match a decoded line item on exact date and signed amount.
+
+### 8c.1 Sector key
+
+Let `pn` be the page number and `si` the sector index (0..7). With
+arithmetic on signed integers and floor shifts:
+
+```
+q     = 103 - si - pn + 2*(pn & 1) + 32*(pn >> 4)
+rot   = 149 + ((q - (q & 1)) mod 256) + 2*phase*(q & 1)
+slope = (5 + 2*(q >> 9) - 4*((pn >> 9) & ~8)) mod 256
+step  = slope * rot^-1 mod 256
+base  = ((pn ^ 0xF1) + si + 167) mod 256
+```
+
+`rot` is odd and lies in 149..405. `base` and `step` are the `base(page,
+sector)` and `step(page, sector)` of section 2.2c, now in closed form: the
+keystream byte at stored offset `i` of a sector is `base + i*step`. The
+relation `step * rot = slope (mod 256)` is why `step` looks irregular: it
+is the modular inverse of a value that changes by 2 from one sector pair to
+the next, scaled by a slowly changing `slope`.
+
+`phase` is one bit. On the sample it is 1 for pages 0..1535, 1952..1959,
+1968..2047 and 4096..8191, and 0 elsewhere; no rule for it was found. It
+only matters where `q` is odd, where it moves `rot` by 2. It is recovered
+per group of eight pages from the page-number check (8c.4) on even pages,
+whose first sector has odd `q`.
+
+### 8c.2 Rotation
+
+A sector's plaintext is rotated by `rot`:
+
+```
+stored[(t + rot) mod 512] = plain[t] + base + ((t + rot) mod 512)*step
+```
+
+This is why a slot directory can start on an odd byte boundary and why
+fields appear cut at 512-byte sector boundaries (sections 5.2 and 6): the
+bytes are contiguous in the rotated sector.
+
+One way to read the two formulas together: the cipher walks the sector with
+stride `rot`, visiting stored positions `rot, 2*rot, ...` (mod 512), adds
+`slope` to its key at every step, and stores at each position the plaintext
+byte of the position before it in the walk.
+
+### 8c.3 The last sector
+
+Sector 7 holds 496 payload bytes; stored offsets 496..511 are the page
+trailer and CRC, stored as they are. The walk of 8c.2 skips those 16
+positions:
+
+- the key does not advance on a skipped position, so the keystream byte at
+  stored offset `i` is `base + i*step + slope*ahead(i)`, where `ahead(i)`
+  counts the trailer positions the walk reaches at or after `i`
+  (the walk position of `i` is `i * rot^-1 mod 512`, taken as 512 for
+  `i = 0`, which the walk reaches last);
+- the plaintext byte `t` is stored at `(t + rot) mod 512`, or, when that is
+  a trailer position, one more stride along.
+
+Reading sector 7 as a plain arithmetic progression is what made records
+there undecodable ("sector-7 hole").
+
+### 8c.4 Header and trailer
+
+After the sectors are restored, 12 bytes trade places: the stored trailer
+bytes `0xFF0..0xFF2` belong at header bytes 18..20 and `0xFF2..0xFFC` at
+header bytes 6..16, and the bytes found there are the last 12 payload bytes
+of the page (`0xFF0..0xFFC`). The universal trailer of section 2.2a is
+therefore part of the page header: the row count and the page type.
+
+The restored header is 28 bytes:
+
+| Offset | Size | Field |
+| -----: | ---: | ----- |
+| 0  | 4 | page number (`u32`) |
+| 6  | 1 | page type (`'e'`, `'a'`, ...), from the trailer |
+| 16 | 1 | `04` on table and extension pages |
+| 17 | 1 | kind: below 16 on table pages, 16 and up on extension pages |
+| 18 | 2 | live row count, from the trailer |
+| 20 | 2 | lowest row offset |
+| 22 | 2 | slot count |
+| 24 | 4 | table id |
+
+**Page-number check.** Every live page carries its own page number in its
+first four bytes. This verifies the key of sector 0, rotation included,
+with no assumption about the page content.
+
+**Checkpoint log.** The last 128 pages of the sample, one contiguous run,
+fail the check while decoding cleanly: 127 carry the number of an earlier
+page (115 distinct numbers) and one has an empty header. They read as
+older images of those pages; compare section 3.2, where most files have
+128 pages more than the superblock's page-count hint. Reading them yields
+duplicate, outdated rows; the reader skips them.
+
+### 8c.5 Rows
+
+The slot directory starts at byte 28, one `u16` per slot; 0 marks a free
+slot. A row starts 28 bytes after its slot value and may run to `0xFFC`:
+
+```
+[length u16] [flags u8] [presence bitmap] [values in column order]
+```
+
+`length` covers the whole row. The bitmap has one bit per nullable column
+(`ISYSTABCOL.nulls = 'Y'`), most significant bit first, in column order; a
+clear bit means NULL and the column takes no bytes. A row shorter than 9
+bytes is padded with zeros to 9.
+
+Catalog rows read the same way. `ISYSTAB` is table 1 (table id at row
+offset 4, then the name as a length-prefixed string) and `ISYSTABCOL` is
+table 2 (table id at 4, column id at 8, domain id at 12, nulls at 14,
+width at 16, scale at 20, then the name).
+
+| Domain | Type | Stored as |
+| -----: | ---- | --------- |
+| 1, 22 | smallint, unsigned smallint | 2 bytes |
+| 2, 21 | integer, unsigned integer | 4 bytes |
+| 20, 23 | bigint, unsigned bigint | 8 bytes |
+| 19, 24 | tinyint, bit | 1 byte |
+| 4, 5 | float, double | 4, 8 bytes |
+| 6 | date | `u32` minutes since 1600-02-29 |
+| 13, 14 | timestamp, time | `u32` minutes since 1600-02-29, `u32` microseconds |
+| 3, 27 | numeric | the layout of section 5.2 |
+| 7..12, 28, 31, 32, 36 | character and binary | see below |
+
+A character or binary value starts with one byte `b`:
+
+- `b < 0x80`: `b` bytes follow.
+- `b = 0xFF`: a big-endian `u16` length follows, then the bytes. Seen for
+  lengths 128..2304.
+- otherwise: `b & 0x7F` prefix bytes of the value follow, then a 13-byte
+  locator `[flag u8] [size u32] [page u32] [2 bytes] [slot u16]` of the
+  whole value, stored outside the row.
+
+A value stored outside the row is a chain of rows on extension pages, each
+`[length u16] [flags u8] [body]`. When bit 2 of `flags` is set the body
+starts with the page (`u32`) and slot (`u16`) of the next piece. The value
+is the first `size` bytes of the concatenated bodies. On the sample all
+10,721 values stored this way resolve to their declared size when only
+live pages (8c.4) are followed. Whether the second, different page list
+described in section 8b is a checkpoint-log image was not examined.
+
+### 8c.6 Open
+
+- A rule for `phase`.
+- Whether the constants hold on other files and QuickBooks versions.
+- More than half of the sample's pages belong to one table of binary
+  values (`I_EXTERNAL_DATA`) whose content is high-entropy after decoding;
+  the values resolve to their declared sizes, and what they hold was not
+  examined.
+
 ## 9. Change log
 
 - **2026-04-19 · C.1-C.4** - Initial specification: corpus survey,
@@ -815,3 +980,8 @@ at the cost of large values being silently absent from its output.
   sectors. Page-walking to QB user tables is blocked on C.19.
   `fill_overlay.recover_base` also rewritten from O(256·n) to O(n)
   via a residue histogram - ~40× speed-up on full-corpus scans.
+- **2026-11-21 · 8c** - Closed-form sector key (base, step, rotation,
+  slope), rotation of each sector, layout of the last sector, the
+  header/trailer exchange, the page-number check, the checkpoint log, the
+  row layout with its presence bitmap, value encodings and values chained
+  outside the row. Derived from one QuickBooks 2024 file; see §8c.

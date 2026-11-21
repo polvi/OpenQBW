@@ -86,6 +86,41 @@ owner can be bridged to the table it reports which stage came up
 empty - catalog presence, `SYSCOLUMN` recovery, or the bridge -
 rather than a bare "not found".
 
+### `tables <input> <output> [--system]`
+
+```console
+$ openqbw tables mybooks.qbw tables.sqlite
+openqbw: pages=31478 live=31349 stale=128 tables=91 rows=195724 clean=195724 partial=0
+```
+
+Writes one SQLite table per table of the company file, named as in the
+catalog, with the catalog's column names. Dates are `YYYY-MM-DD`,
+timestamps `YYYY-MM-DD HH:MM:SS.ffffff`, numerics exact decimal strings and
+binary values BLOBs. Four bookkeeping columns come first:
+
+- `_page`, `_slot`: where the row is in the file.
+- `_decode_error`: why decoding stopped early; NULL for a complete row.
+- `_raw_tail`: the bytes that were not decoded; NULL for a complete row.
+
+`_decode_stats` has one row per exported table (`rows`, `clean`, `partial`,
+`columns`, `missing_columns`) and `_meta` records the page counts. A column
+name that repeats without regard to case gets a trailing underscore.
+`--system` also exports the SQL Anywhere system tables (`ISYS...`,
+`SYS...`).
+
+This command removes the page cipher exactly (SPECIFICATION.md section 8c)
+instead of estimating a keystream per page, so it does not use `--lenient`.
+The method was derived from one QuickBooks 2024 file. A file it does not fit
+is refused with exit status 1:
+
+```text
+0 of 7 written pages name their own page number after decoding; the page cipher of this file is not the one this reader knows
+```
+
+Pages at the end of the file that hold earlier images of other pages (the
+checkpoint log) are not read; their count is printed as `stale`. The output
+is staged and protected the same way as `export`.
+
 ### `export <input> <output>`
 
 ```console

@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `openqbw tables <input> <output>` exports every table of a company file
+  to SQLite with the catalog's column names and types, and `TableReader`
+  (`Table`, `Column`, `Row`, `Value`) does the same in the library. It
+  removes the page cipher exactly, with a closed-form key per sector, the
+  rotation of each sector, the layout of the last sector and the
+  header/trailer exchange, then reads `ISYSTAB`, `ISYSTABCOL`, rows by
+  their presence bitmap and values chained outside the row. Checkpoint-log
+  pages at the end of the file are skipped. Derived from one QuickBooks
+  2024 file, where every live page verifies by its own page number and
+  every row decodes to its exact length; other files are untested
+  (SPECIFICATION.md section 8c).
+- `Error::KeystreamMismatch` and `ErrorKind::KeystreamMismatch` report a
+  file the exact page cipher does not fit.
+
 - Read the company database directly from zlib-compressed QBB backups
   (`openqbw catalog books.qbb`, `Reader::open`). A backup is recognised by its
   compound-file signature, not its extension. Thanks to @lems111 for the
